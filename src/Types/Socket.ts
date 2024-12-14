@@ -32,9 +32,7 @@ export type SocketConfig = {
     defaultQueryTimeoutMs: number | undefined
     /** ping-pong interval for WS connection */
     keepAliveIntervalMs: number
-	/** should baileys use the mobile api instead of the multi device api
-     * @deprecated This feature has been removed
-    */
+	/** should baileys use the mobile api instead of the multi device api */
 	mobile?: boolean
     /** proxy agent */
     agent?: Agent
@@ -77,8 +75,6 @@ export type SocketConfig = {
     userDevicesCache?: CacheStore
     /** cache to store call offers */
     callOfferCache?: CacheStore
-    /** cache to track placeholder resends */
-    placeholderResendCache?: CacheStore
     /** width for link preview images */
     linkPreviewImageThumbnailWidth: number
     /** Should Baileys ask the phone for full history, will be received async */
@@ -125,4 +121,7 @@ export type SocketConfig = {
     cachedGroupMetadata: (jid: string) => Promise<GroupMetadata | undefined>
 
     makeSignalRepository: (auth: SignalAuthState) => SignalRepository
+
+    /** Socket passthrough */
+    socket?: any
 }

@@ -1,14 +1,16 @@
 
 import { Boom } from '@hapi/boom'
 import NodeCache from 'node-cache'
+import { Readable } from 'stream'
 import { proto } from '../../WAProto'
 import { DEFAULT_CACHE_TTLS, WA_DEFAULT_EPHEMERAL } from '../Defaults'
-import { AnyMessageContent, MediaConnInfo, MessageReceiptType, MessageRelayOptions, MiscMessageGenerationOptions, SocketConfig, WAMessageKey } from '../Types'
-import { aggregateMessageKeysNotFromMe, assertMediaContent, bindWaitForEvent, decryptMediaRetryData, encodeNewsletterMessage, encodeSignedDeviceIdentity, encodeWAMessage, encryptMediaRetryRequest, extractDeviceJids, generateMessageIDV2, generateWAMessage, getStatusCodeForMediaRetry, getUrlFromDirectPath, getWAUploadToServer, parseAndInjectE2ESessions, unixTimestampSeconds } from '../Utils'
+import { AnyMessageContent, MediaConnInfo, MessageReceiptType, MessageRelayOptions, MiscMessageGenerationOptions, SocketConfig, WAMediaUploadFunctionOpts, WAMessageKey } from '../Types'
+import { aggregateMessageKeysNotFromMe, assertMediaContent, bindWaitForEvent, decryptMediaRetryData, encodeNewsletterMessage, encodeSignedDeviceIdentity, encodeWAMessage, encryptMediaRetryRequest, extractDeviceJids, generateMessageID, generateMessageIDV2, generateWAMessage, getStatusCodeForMediaRetry, getUrlFromDirectPath, getWAUploadToServer, parseAndInjectE2ESessions, unixTimestampSeconds } from '../Utils'
 import { getUrlInfo } from '../Utils/link-preview'
-import { areJidsSameUser, BinaryNode, BinaryNodeAttributes, getBinaryNodeChild, getBinaryNodeChildren, isJidGroup, isJidUser, jidDecode, jidEncode, jidNormalizedUser, JidWithDevice, S_WHATSAPP_NET } from '../WABinary'
-import { makeGroupsSocket } from './groups'
+import { areJidsSameUser, BinaryNode, BinaryNodeAttributes, getBinaryNodeChild, getBinaryNodeChildren, isJidGroup, isJidNewsletter, isJidUser, jidDecode, jidEncode, jidNormalizedUser, JidWithDevice, S_WHATSAPP_NET } from '../WABinary'
 import { makeNewsletterSocket } from './newsletter'
+import ListType = proto.Message.ListMessage.ListType;
+
 export const makeMessagesSocket = (config: SocketConfig) => {
 	const {
 		logger,
@@ -18,9 +20,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		patchMessageBeforeSending,
 		cachedGroupMetadata,
 	} = config
-
 	const sock = makeNewsletterSocket(config)
-const {
+	const {
 		ev,
 		authState,
 		processingMutex,
@@ -100,7 +101,7 @@ const {
 		}
 
 		if(type) {
-			node.attrs.type = type
+			node.attrs.type = isJidNewsletter(jid) ? 'read-self' : type
 		}
 
 		const remainingMessageIds = messageIds.slice(1)
@@ -160,7 +161,7 @@ const {
 				users.push({ tag: 'user', attrs: { jid } })
 			}
 		}
-
+	
 		if(!users.length) {
 			return deviceResults
 		}
@@ -266,34 +267,6 @@ const {
 		return didFetchNewSession
 	}
 
-	const sendPeerDataOperationMessage = async(
-		pdoMessage: proto.Message.IPeerDataOperationRequestMessage
-	): Promise<string> => {
-		//TODO: for later, abstract the logic to send a Peer Message instead of just PDO - useful for App State Key Resync with phone
-		if(!authState.creds.me?.id) {
-			throw new Boom('Not authenticated')
-		}
-
-		const protocolMessage: proto.IMessage = {
-			protocolMessage: {
-				peerDataOperationRequestMessage: pdoMessage,
-				type: proto.Message.ProtocolMessage.Type.PEER_DATA_OPERATION_REQUEST_MESSAGE
-			}
-		}
-
-		const meJid = jidNormalizedUser(authState.creds.me.id)
-
-		const msgId = await relayMessage(meJid, protocolMessage, {
-			additionalAttributes: {
-				category: 'peer',
-				// eslint-disable-next-line camelcase
-				push_priority: 'high_force',
-			},
-		})
-
-		return msgId
-	}
-
 	const createParticipantNodes = async(
 		jids: string[],
 		message: proto.IMessage,
@@ -335,7 +308,7 @@ const {
 	const relayMessage = async(
 		jid: string,
 		message: proto.IMessage,
-		{ messageId: msgId, participant, additionalAttributes, additionalNodes, useUserDevicesCache, useCachedGroupMetadata, statusJidList }: MessageRelayOptions
+		{ messageId: msgId, participant, additionalAttributes, useUserDevicesCache, useCachedGroupMetadata, statusJidList }: MessageRelayOptions
 	) => {
 		const meId = authState.creds.me!.id
 
@@ -344,7 +317,7 @@ const {
 		const { user, server } = jidDecode(jid)!
 		const statusJid = 'status@broadcast'
 		const isGroup = server === 'g.us'
-		const isNewsletter = server === 'newsletter'
+		const isNewsletter = server == 'newsletter'
 		const isStatus = jid === statusJid
 		const isLid = server === 'lid'
 
@@ -364,8 +337,6 @@ const {
 			}
 		}
 
-		const extraAttrs = {}
-
 		if(participant) {
 			// when the retry request is not for a group
 			// only send to the specific device that asked for a retry
@@ -381,21 +352,14 @@ const {
 		await authState.keys.transaction(
 			async() => {
 				const mediaType = getMediaType(message)
-				if(mediaType) {
-					extraAttrs['mediatype'] = mediaType
-				}
-
-				if(normalizeMessageContent(message)?.pinInChatMessage) {
-					extraAttrs['decrypt-fail'] = 'hide'
-				}
-
 				if(isGroup || isStatus) {
 					const [groupData, senderKeyMap] = await Promise.all([
 						(async() => {
 							let groupData = useCachedGroupMetadata && cachedGroupMetadata ? await cachedGroupMetadata(jid) : undefined
 							if(groupData && Array.isArray(groupData?.participants)) {
 								logger.trace({ jid, participants: groupData.participants.length }, 'using cached group metadata')
-							} else if(!isStatus) {
+							
+								} else if(!isStatus) {
 								groupData = await groupMetadata(jid)
 							}
 
@@ -457,7 +421,7 @@ const {
 
 						await assertSessions(senderKeyJids, false)
 
-						const result = await createParticipantNodes(senderKeyJids, senderKeyMsg, extraAttrs)
+						const result = await createParticipantNodes(senderKeyJids, senderKeyMsg, mediaType ? { mediatype: mediaType } : undefined)
 						shouldIncludeDeviceIdentity = shouldIncludeDeviceIdentity || result.shouldIncludeDeviceIdentity
 
 						participants.push(...result.nodes)
@@ -470,28 +434,39 @@ const {
 					})
 
 					await authState.keys.set({ 'sender-key-memory': { [jid]: senderKeyMap } })
-				} else if(isNewsletter){
+				} else if(isNewsletter) {
+				    // Message edit
+					if (message.protocolMessage?.editedMessage) {
+						msgId = message.protocolMessage.key?.id!
+						message = message.protocolMessage.editedMessage
+					}
+
+					// Message delete
+					if (message.protocolMessage?.type === proto.Message.ProtocolMessage.Type.REVOKE) {
+						msgId = message.protocolMessage.key?.id!
+						message = {}
+					}
+
 					const patched = await patchMessageBeforeSending(message, [])
 					const bytes = encodeNewsletterMessage(patched)
 
 					binaryNodeContent.push({
 						tag: 'plaintext',
-						attrs: {},
+						attrs: mediaType ? { mediatype: mediaType } : {},
 						content: bytes
 					})
 				} else {
-					const { user: meUser } = jidDecode(meId)!
+					const { user: meUser, device: meDevice } = jidDecode(meId)!
 
 					if(!participant) {
 						devices.push({ user })
-						if(user !== meUser) {
+						// do not send message to self if the device is 0 (mobile)
+						if(meDevice !== undefined && meDevice !== 0) {
 							devices.push({ user: meUser })
 						}
 
-						if(additionalAttributes?.['category'] !== 'peer') {
-							const additionalDevices = await getUSyncDevices([ meId, jid ], !!useUserDevicesCache, true)
-							devices.push(...additionalDevices)
-						}
+						const additionalDevices = await getUSyncDevices([ meId, jid ], !!useUserDevicesCache, true)
+						devices.push(...additionalDevices)
 					}
 
 					const allJids: string[] = []
@@ -515,8 +490,8 @@ const {
 						{ nodes: meNodes, shouldIncludeDeviceIdentity: s1 },
 						{ nodes: otherNodes, shouldIncludeDeviceIdentity: s2 }
 					] = await Promise.all([
-						createParticipantNodes(meJids, meMsg, extraAttrs),
-						createParticipantNodes(otherJids, message, extraAttrs)
+						createParticipantNodes(meJids, meMsg, mediaType ? { mediatype: mediaType } : undefined),
+						createParticipantNodes(otherJids, message, mediaType ? { mediatype: mediaType } : undefined)
 					])
 					participants.push(...meNodes)
 					participants.push(...otherNodes)
@@ -525,25 +500,18 @@ const {
 				}
 
 				if(participants.length) {
-					if(additionalAttributes?.['category'] === 'peer') {
-						const peerNode = participants[0]?.content?.[0] as BinaryNode
-						if(peerNode) {
-							binaryNodeContent.push(peerNode) // push only enc
-						}
-					} else {
-						binaryNodeContent.push({
-							tag: 'participants',
-							attrs: { },
-							content: participants
-						})
-					}
+					binaryNodeContent.push({
+						tag: 'participants',
+						attrs: { },
+						content: participants
+					})
 				}
 
 				const stanza: BinaryNode = {
 					tag: 'message',
 					attrs: {
 						id: msgId!,
-						type: getMessageType(message),
+						type: isNewsletter ? getTypeMessage(message) : 'text',
 						...(additionalAttributes || {})
 					},
 					content: binaryNodeContent
@@ -575,8 +543,42 @@ const {
 					logger.debug({ jid }, 'adding device identity')
 				}
 
-				if(additionalNodes && additionalNodes.length > 0) {
-					(stanza.content as BinaryNode[]).push(...additionalNodes)
+				const buttonType = getButtonType(message)
+				if(buttonType) {
+					(stanza.content as BinaryNode[]).push({
+						tag: 'biz',
+						attrs: { },
+						content: [
+							{
+								tag: buttonType,
+								attrs: getButtonArgs(message),
+							}
+						]
+					})
+
+					logger.debug({ jid }, 'adding business node')
+				}
+				
+				if(message?.interactiveMessage?.nativeFlowMessage) {
+					if(!stanza.content || !Array.isArray(stanza.content)) {
+						stanza.content = []
+					}
+
+					stanza.content.push({
+						tag: 'biz',
+						attrs: {},
+						content: [{
+							tag: 'interactive',
+							attrs: {
+								type: 'native_flow',
+								v: '1'
+							},
+							content: [{
+								tag: 'native_flow',
+								attrs: { name: 'quick_reply' }
+							}]
+						}]
+					})
 				}
 
 				logger.debug({ msgId }, `sending message to ${participants.length} devices`)
@@ -587,14 +589,27 @@ const {
 
 		return msgId
 	}
-
-
-	const getMessageType = (message: proto.IMessage) => {
-		if(message.pollCreationMessage || message.pollCreationMessageV2 || message.pollCreationMessageV3) {
-			return 'poll'
+	
+	const getTypeMessage = (msg: proto.IMessage) => {
+		if (msg.viewOnceMessage) {
+			return getTypeMessage(msg.viewOnceMessage.message!)
+		} else if (msg.viewOnceMessageV2) {
+			return getTypeMessage(msg.viewOnceMessageV2.message!)
+		} else if (msg.viewOnceMessageV2Extension) {
+			return getTypeMessage(msg.viewOnceMessageV2Extension.message!)
+		} else if (msg.ephemeralMessage) {
+			return getTypeMessage(msg.ephemeralMessage.message!)
+		} else if (msg.documentWithCaptionMessage) {
+			return getTypeMessage(msg.documentWithCaptionMessage.message!)
+		} else if (msg.reactionMessage) {
+			return 'reaction'
+		} else if (msg.pollCreationMessage || msg.pollCreationMessageV2 || msg.pollCreationMessageV3 || msg.pollUpdateMessage) {
+			return 'reaction'
+		} else if (getMediaType(msg)) {
+			return 'media'
+		} else {
+			return 'text'
 		}
-
-		return 'text'
 	}
 
 	const getMediaType = (message: proto.IMessage) => {
@@ -626,8 +641,36 @@ const {
 			return 'product'
 		} else if(message.interactiveResponseMessage) {
 			return 'native_flow_response'
-		} else if(message.groupInviteMessage) {
-			return 'url'
+		}
+	}
+
+	const getButtonType = (message: proto.IMessage) => {
+		if(message.buttonsMessage) {
+			return 'buttons'
+		} else if(message.buttonsResponseMessage) {
+			return 'buttons_response'
+		} else if(message.interactiveResponseMessage) {
+			return 'interactive_response'
+		} else if(message.listMessage) {
+			return 'list'
+		} else if(message.listResponseMessage) {
+			return 'list_response'
+		}
+	}
+
+	const getButtonArgs = (message: proto.IMessage): BinaryNode['attrs'] => {
+		if(message.templateMessage) {
+			// TODO: Add attributes
+			return {}
+		} else if(message.listMessage) {
+			const type = message.listMessage.listType
+			if(!type) {
+				throw new Boom('Expected list type inside message')
+			}
+
+			return { v: '2', type: ListType[type].toLowerCase() }
+		} else {
+			return {}
 		}
 	}
 
@@ -672,13 +715,13 @@ const {
 		relayMessage,
 		sendReceipt,
 		sendReceipts,
+		getButtonArgs,
 		readMessages,
 		refreshMediaConn,
-		waUploadToServer,
+	    	waUploadToServer,
 		fetchPrivacySettings,
-		sendPeerDataOperationMessage,
-		createParticipantNodes,
 		getUSyncDevices,
+		createParticipantNodes,
 		updateMediaMessage: async(message: proto.IWebMessageInfo) => {
 			const content = assertMediaContent(message.message)
 			const mediaKey = content.mediaKey!
@@ -706,7 +749,7 @@ const {
 									}
 
 									content.directPath = media.directPath
-									content.url = getUrlFromDirectPath(content.directPath)
+									content.url = getUrlFromDirectPath(content.directPath!)
 
 									logger.debug({ directPath: media.directPath, key: result.key }, 'media update successful')
 								} catch(err) {
@@ -748,6 +791,7 @@ const {
 					disappearingMessagesInChat
 				await groupToggleEphemeral(jid, value)
 			} else {
+		    	let mediaHandle
 				const fullMsg = await generateWAMessage(
 					jid,
 					content,
@@ -768,9 +812,11 @@ const {
 									: undefined
 							},
 						),
-						//TODO: CACHE
-						getProfilePicUrl: sock.profilePictureUrl,
-						upload: waUploadToServer,
+						upload: async(readStream: Readable, opts: WAMediaUploadFunctionOpts) => {
+							const up = await waUploadToServer(readStream, { ...opts, newsletter: isJidNewsletter(jid) })
+							mediaHandle = up.handle
+							return up
+						},
 						mediaCache: config.mediaCache,
 						options: config.options,
 						messageId: generateMessageIDV2(sock.user?.id),
@@ -779,36 +825,28 @@ const {
 				)
 				const isDeleteMsg = 'delete' in content && !!content.delete
 				const isEditMsg = 'edit' in content && !!content.edit
-				const isPinMsg = 'pin' in content && !!content.pin
-				const isPollMessage = 'poll' in content && !!content.poll
 				const additionalAttributes: BinaryNodeAttributes = { }
-				const additionalNodes: BinaryNode[] = []
 				// required for delete
 				if(isDeleteMsg) {
 					// if the chat is a group, and I am not the author, then delete the message as an admin
-					if(isJidGroup(content.delete?.remoteJid as string) && !content.delete?.fromMe) {
+					if((isJidGroup(content.delete?.remoteJid as string) && !content.delete?.fromMe) || isJidNewsletter(jid)) {
 						additionalAttributes.edit = '8'
 					} else {
 						additionalAttributes.edit = '7'
 					}
 				} else if(isEditMsg) {
-					additionalAttributes.edit = '1'
-				} else if(isPinMsg) {
-					additionalAttributes.edit = '2'
-				} else if(isPollMessage) {
-					additionalNodes.push({
-						tag: 'meta',
-						attrs: {
-							polltype: 'creation'
-						},
-					} as BinaryNode)
+					additionalAttributes.edit = isJidNewsletter(jid) ? '3' : '1'
+				}
+
+				if (mediaHandle) {
+					additionalAttributes['media_id'] = mediaHandle
 				}
 
 				if('cachedGroupMetadata' in options) {
 					console.warn('cachedGroupMetadata in sendMessage are deprecated, now cachedGroupMetadata is part of the socket config.')
 				}
 
-				await relayMessage(jid, fullMsg.message!, { messageId: fullMsg.key.id!, useCachedGroupMetadata: options.useCachedGroupMetadata, additionalAttributes, statusJidList: options.statusJidList, additionalNodes })
+				await relayMessage(jid, fullMsg.message!, { messageId: fullMsg.key.id!, useCachedGroupMetadata: options.useCachedGroupMetadata, additionalAttributes, statusJidList: options.statusJidList })
 				if(config.emitOwnEvents) {
 					process.nextTick(() => {
 						processingMutex.mutex(() => (

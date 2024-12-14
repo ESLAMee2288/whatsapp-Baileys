@@ -78,6 +78,16 @@ export default (config: BaileysInMemoryStoreConfig) => {
 		}
 	}
 
+	const getValidContacts = () => {
+		for(const contact of Object.keys(contacts)) {
+			if (contact.indexOf('@') < 0) {
+				delete contacts[contact]
+			}
+		}
+
+		return Object.keys(contacts)
+	}
+
 	/**
 	 * binds to a BaileysEventEmitter.
 	 * It listens to all events and constructs a state that you can query accurate data from.
@@ -93,14 +103,8 @@ export default (config: BaileysInMemoryStoreConfig) => {
 			chats: newChats,
 			contacts: newContacts,
 			messages: newMessages,
-			isLatest,
-			syncType
+			isLatest
 		}) => {
-			if(syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
-				return // FOR NOW,
-				//TODO: HANDLE
-			}
-
 			if(isLatest) {
 				chats.clear()
 
@@ -136,28 +140,28 @@ export default (config: BaileysInMemoryStoreConfig) => {
 
 		ev.on('contacts.update', async updates => {
 			for(const update of updates) {
-				let contact: Contact
+			    let contact: Contact
 				if(contacts[update.id!]) {
 					contact = contacts[update.id!]
 				} else {
-					const contactHashes = await Promise.all(Object.keys(contacts).map(async contactId => {
+					const validContacts = getValidContacts()
+					const contactHashes = validContacts.map((contactId) => {
 						const { user } = jidDecode(contactId)!
-						return [contactId, (await md5(Buffer.from(user + 'WA_ADD_NOTIF', 'utf8'))).toString('base64').slice(0, 3)]
-					}))
+						return [contactId, (md5(Buffer.from(user + 'WA_ADD_NOTIF', 'utf8'))).toString('base64').slice(0, 3)]
+					})
 					contact = contacts[contactHashes.find(([, b]) => b === update.id)?.[0] || ''] // find contact by attrs.hash, when user is not saved as a contact
 				}
-
+								
 				if(contact) {
 					if(update.imgUrl === 'changed') {
 						contact.imgUrl = socket ? await socket?.profilePictureUrl(contact.id) : undefined
 					} else if(update.imgUrl === 'removed') {
 						delete contact.imgUrl
 					}
+					Object.assign(contacts[contact.id], contact)
 				} else {
-					return logger.debug({ update }, 'got update for non-existant contact')
+					logger.debug({ update }, 'got update for non-existant contact')
 				}
-
-				Object.assign(contacts[contact.id], contact)
 			}
 		})
 		ev.on('chats.upsert', newChats => {
@@ -225,14 +229,16 @@ export default (config: BaileysInMemoryStoreConfig) => {
 					const list = assertMessageList(jid)
 					list.upsert(msg, 'append')
 
-					if(type === 'notify' && !chats.get(jid)) {
-						ev.emit('chats.upsert', [
-							{
-								id: jid,
-								conversationTimestamp: toNumber(msg.messageTimestamp),
-								unreadCount: 1
-							}
-						])
+					if(type === 'notify') {
+						if(!chats.get(jid)) {
+							ev.emit('chats.upsert', [
+								{
+									id: jid,
+									conversationTimestamp: toNumber(msg.messageTimestamp),
+									unreadCount: 1
+								}
+							])
+						}
 					}
 				}
 

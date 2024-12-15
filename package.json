@@ -1,8 +1,24 @@
 {
-  "name": "baileys",
-  "version": "7.0.0",
+  "name": "@ESLAMee2288/whatsapp-Baileys",
+  "version": "6.7.5",
   "description": "WhatsApp API",
-
+  "keywords": [
+    "whatsapp",
+    "js-whatsapp",
+    "whatsapp-api",
+    "whatsapp-web",
+    "whatsapp-chat",
+    "whatsapp-group",
+    "automation",    
+    "whatsapp-chanel",
+    "multi-device"
+  ],
+  "homepage": "https://github.com/ESLAMee2288/whatsapp-Baileys",
+  "repository": {
+    "url": "git+ssh://git@github.com/ESLAMee2288/whatsapp-Baileys.git"
+  },
+  "license": "MIT",
+  "author": "Eslam Elshnawy",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "files": [
